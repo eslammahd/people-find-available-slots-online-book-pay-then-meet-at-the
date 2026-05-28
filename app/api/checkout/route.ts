@@ -1,35 +1,90 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { stripe, calculatePrice } from '@/lib/stripe';
-import { createAdminClient } from '@/lib/supabase/admin';
-const PRICE_PER_HOUR_CENTS = parseInt(process.env.PRICE_PER_HOUR_CENTS || '15000');
-const SCHEMA = process.env.SUPABASE_SCHEMA || 'public';
+import { stripe } from '@/lib/stripe';
+import { createServerClient } from '@/lib/supabase-server';
+
 export async function POST(req: NextRequest) {
   try {
-    const { slotId, guestName, guestEmail, guestPhone, durationMinutes, notes } = await req.json();
-    if (!slotId || !guestName || !guestEmail || !durationMinutes) return NextResponse.json({ error: 'Missing required fields.' }, { status: 400 });
-    if (durationMinutes > 120) return NextResponse.json({ error: 'Maximum session duration is 2 hours.' }, { status: 400 });
-    const supabase = createAdminClient();
-    const { data: slot, error: slotError } = await supabase.schema(SCHEMA).from('availability_slots').select('*').eq('id', slotId).eq('is_booked', false).single();
-    if (slotError || !slot) return NextResponse.json({ error: 'This slot is no longer available.' }, { status: 409 });
-    const priceCents = calculatePrice(durationMinutes, PRICE_PER_HOUR_CENTS);
-    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000';
-    const { data: booking, error: bookingError } = await supabase.schema(SCHEMA).from('bookings').insert({
-      slot_id: slotId, guest_name: guestName, guest_email: guestEmail, guest_phone: guestPhone || null,
-      duration_minutes: durationMinutes, price_cents: priceCents, status: 'pending', notes: notes || null,
-    }).select().single();
-    if (bookingError || !booking) return NextResponse.json({ error: 'Failed to create booking.' }, { status: 500 });
+    const body = await req.json();
+    const { slotId, bookingDate, startTime, endTime, durationMinutes, patientName, patientEmail, patientPhone, notes } = body;
+
+    if (!slotId || !bookingDate || !startTime || !patientName || !patientEmail) {
+      return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
+    }
+
+    const supabase = createServerClient();
+
+    // Check not already booked
+    const { data: existing } = await supabase
+      .from('bookings')
+      .select('id')
+      .eq('slot_id', slotId)
+      .eq('booking_date', bookingDate)
+      .in('status', ['confirmed', 'pending'])
+      .single();
+
+    if (existing) {
+      return NextResponse.json({ error: 'This slot has just been booked. Please choose another.' }, { status: 409 });
+    }
+
+    // Get price from settings
+    const { data: settings } = await supabase.from('settings').select('*').single();
+    if (!settings) return NextResponse.json({ error: 'Settings not found' }, { status: 500 });
+
+    // Create pending booking
+    const { data: booking, error: bookingError } = await supabase
+      .from('bookings')
+      .insert({
+        slot_id: slotId,
+        booking_date: bookingDate,
+        start_time: startTime,
+        end_time: endTime,
+        duration_minutes: durationMinutes,
+        patient_name: patientName,
+        patient_email: patientEmail,
+        patient_phone: patientPhone || null,
+        notes: notes || null,
+        status: 'pending',
+        amount_paid: settings.session_price_cents,
+      })
+      .select()
+      .single();
+
+    if (bookingError || !booking) {
+      return NextResponse.json({ error: 'Failed to create booking' }, { status: 500 });
+    }
+
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || `https://${req.headers.get('host')}`;
+
+    // Create Stripe session
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: settings.currency,
+          product_data: {
+            name: `Therapy Session with Dr. Saad El Mahdy`,
+            description: `${new Date(bookingDate + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })} at ${startTime} · ${durationMinutes} minutes`,
+          },
+          unit_amount: settings.session_price_cents,
+        },
+        quantity: 1,
+      }],
       mode: 'payment',
-      customer_email: guestEmail,
-      line_items: [{ price_data: { currency: 'usd', unit_amount: priceCents, product_data: { name: 'Therapy Session \u2014 Dr. Saad El Mahdy', description: `${durationMinutes}-minute online session via Google Meet` } }, quantity: 1 }],
-      metadata: { booking_id: booking.id, slot_id: slotId, guest_name: guestName, guest_email: guestEmail, duration_minutes: String(durationMinutes) },
-      success_url: `${baseUrl}/booking/success?booking_id=${booking.id}&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${baseUrl}/book?cancelled=true`,
+      customer_email: patientEmail,
+      success_url: `${baseUrl}/book/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${baseUrl}/book/cancelled`,
+      metadata: { bookingId: booking.id },
     });
-    await supabase.schema(SCHEMA).from('bookings').update({ stripe_session_id: session.id }).eq('id', booking.id);
+
+    // Store stripe session ID
+    await supabase
+      .from('bookings')
+      .update({ stripe_session_id: session.id })
+      .eq('id', booking.id);
+
     return NextResponse.json({ url: session.url });
-  } catch (err: unknown) {
-    return NextResponse.json({ error: err instanceof Error ? err.message : 'Internal error' }, { status: 500 });
+  } catch (err) {
+    console.error('Checkout error:', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
